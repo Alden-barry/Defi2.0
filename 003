@@ -1,0 +1,259 @@
+rust
+use solana_program::{
+    account_info::{AccountInfo, next_account_info},
+    entrypoint,
+    entrypoint::ProgramResult,
+    msg,
+    program_error::ProgramError,
+    pubkey::PubKey,
+    sysvar::{rent::Rent, Sysvar},
+};
+use std::collections::{HashMap, HashSet};
+
+// Enum to represent different borrowing tiers with their respective interest rates and max borrowing amounts
+enum BorrowingTier {
+    Tier1 {
+        interest_rate: u8,
+        max_amount: u64,
+    },
+    Tier2 {
+        interest_rate: u8,
+        max_amount: u64,
+    },
+    Tier3 {
+        interest_rate: u8,
+        max_amount: u64,
+    },
+}
+
+// Struct to manage collateral information for each user's borrowing
+struct Collateral {
+    collateral_token_account: AccountInfo<'static>,
+    locked_amount: u64,
+}
+
+// The main LoanPool struct that manages the lending and borrowing operations
+#[derive(Debug)]
+struct LoanPool {
+    // The account that holds the token used for lending and borrowing
+    token_account: AccountInfo<'static>,
+    // Available funds in the pool for lending
+    available_funds: u64,
+    // Mapping of user accounts to their borrowing details (amount, tier, due date, etc.)
+    borrowers: HashMap<PubKey, (u64, BorrowingTier, u64)>, // (borrowed amount, tier, due date)
+    // Mapping of user accounts to their collateral details (if any)
+    collateral: HashMap<PubKey, Vec<Collateral>>,
+    // Interest rates for different borrowing tiers
+    tier_interest_rates: HashMap<BorrowingTier, u8>,
+    // Max borrowing amounts for different borrowing tiers
+    tier_max_amounts: HashMap<BorrowingTier, u64>,
+}
+
+// Program entry point
+entrypoint!(process_instruction);
+
+// Main function to process instructions
+fn process_instruction(
+    program_id: &PubKey,
+    accounts: &[AccountInfo<'static>],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let loan_pool_account = next_account_info(accounts_iter)?;
+    let token_account = next_account_info(accounts_iter)?;
+    let user_account = next_account_info(accounts_iter)?;
+
+    let rent = Rent::get()?;
+    if!rent.is_exempt(loan_pool_account.lamports(), loan_pool_account.data_len()) {
+        return Err(ProgramError::InsufficientFunds);
+    }
+
+    let mut loan_pool = LoanPool {
+        token_account: token_account.clone(),
+        available_funds: 0,
+        borrowers: HashMap::new(),
+        collateral: HashMap::new(),
+        tier_interest_rates: HashMap::new(),
+        tier_max_amounts: HashMap::new(),
+    };
+    // Initialize borrowing tiers and their interest rates and max amounts
+    loan_pool.tier_interest_rates.insert(
+        BorrowingTier::Tier1 {
+            interest_rate: 5,
+            max_amount: 5000,
+        },
+        5,
+    );
+    loan_pool.tier_max_amounts.insert(
+        BorrowingTier::Tier1 {
+            interest_rate: 5,
+            max_amount: 5000,
+        },
+        5000,
+    );
+    loan_pool.tier_interest_rates.insert(
+        BorrowingTier::Tier2 {
+            interest_rate: 8,
+            max_amount: 10000,
+        },
+        8,
+    );
+    loan_pool.tier_max_amounts.insert(
+        BorrowingTier::Tier2 {
+            interest_rate: 8,
+            max_amount: 10000,
+        },
+        10000,
+    );
+    loan_pool.tier_interest_rates.insert(
+        BorrowingTier::Tier3 {
+            interest_rate: 12,
+            max_amount: 20000,
+        },
+        12,
+    );
+    loan_pool.tier_max_amounts.insert(
+        BorrowingTier::Tier3 {
+            interest_rate: 12,
+            max_amount: 20000,
+        },
+        20000,
+    );
+
+    match instruction_data[0] {
+        0 => deposit(&mut loan_pool, user_account, instruction_data[1..].to_vec()),
+        1 => borrow(&mut loan_pool, user_account, instruction_data[1..].to_vec()),
+        2 => repay(&mut loan_pool, user_account, instruction_data[1..].to_vec()),
+        3 => check_balance(&loan_pool, user_account),
+        4 => lock_collateral(&mut loan_pool, accounts_iter),
+        5 => release_collateral(&mut loan_pool, user_account, instruction_data[1..].to_vec()),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+// Function to handle depositing tokens into the loan pool
+fn deposit(
+    loan_pool: &mut LoanPool,
+    user_account: &AccountInfo<'static>,
+    amount_data: Vec<u64>,
+) -> ProgramResult {
+    let amount = amount_data[0];
+    if amount == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+    // Here, we would need to implement the actual token transfer logic from the user's account to the loan pool's token account using Solana's token program.
+    // For simplicity, we just update the available funds for now.
+    loan_pool.available_funds += amount;
+    msg!("Deposit successful. New available funds: {}", loan_pool.available_funds);
+    Ok(())
+}
+
+// Function to handle borrowing tokens from the loan pool
+fn borrow(
+    loan_pool: &mut LoanPool,
+    user_account: &AccountInfo<'static>,
+    amount_data: Vec<u64>,
+) -> ProgramResult {
+    let requested_amount = amount_data[0];
+    if requested_amount == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+    let user_key = user_account.key;
+    let borrowing_tier = determine_borrowing_tier(&loan_pool, requested_amount);
+    if let Some(tier) = borrowing_tier {
+        if loan_pool.available_funds < requested_amount {
+            return Err(ProgramError::InsufficientFunds);
+        }
+        if loan_pool.tier_max_amounts[&tier] < requested_amount {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        loan_pool.available_funds -= requested_amount;
+        loan_pool.borrowers.insert(*user_key, (requested_amount, tier, 0)); // Set due date to 0 for now, we can implement proper due date logic later.
+        msg!("Borrow successful. Borrowed amount: {}, Tier: {:?}", requested_amount, tier);
+        Ok(())
+    } else {
+        Err(ProgramError::InvalidAccountData)
+    }
+}
+
+// Function to determine the borrowing tier based on the requested amount
+fn determine_borrowing_tier(loan_pool: &LoanPool, requested_amount: u64) -> Option<BorrowingTier> {
+    for (tier, max_amount) in loan_pool.tier_max_amounts.iter() {
+        if requested_amount <= *max_amount {
+            return Some(tier.clone());
+        }
+    }
+    None
+}
+
+// Function to handle repaying borrowed tokens
+fn repay(
+    loan_pool: &mut LoanPool,
+    user_account: &AccountInfo<'static>,
+    amount_data: Vec<u64>,
+) -> ProgramResult {
+    let user_key = user_account.key;
+    let repayment_amount = amount_data[0];
+    if repayment_amount == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if let Some((borrowed_amount, tier, due_date)) = loan_pool.borrowers.get_mut(user_key) {
+        let interest = ((*borrowed_amount as u128) * (loan_pool.tier_interest_rates[tier] as u128) / 100) as u64;
+        let total_amount_to_repay = borrowed_amount + interest;
+        if repayment_amount >= total_amount_to_repay {
+            // Implement token transfer logic to deduct the repayment amount from the user's account.
+            *borrowed_amount = 0;
+            loan_pool.available_funds += total_amount_to_repay;
+            msg!("Repay successful. Remaining available funds: {}", loan_pool.available_funds);
+            Ok(())
+        } else if repayment_amount >= *borrowed_amount {
+            let remaining_interest = repayment_amount - *borrowed_amount;
+            *borrowed_amount = 0;
+            loan_pool.available_funds += repayment_amount;
+            // Update the interest remaining to be paid
+            // Here we could have more complex logic to handle partial repayments better.
+            msg!("Partial repay successful. Remaining interest: {}", remaining_interest);
+            Ok(())
+        } else {
+            *borrowed_amount -= repayment_amount;
+            loan_pool.available_funds += repayment_amount;
+            msg!("Partial repay successful. Remaining borrowed amount: {}", borrowed_amount);
+            Ok(())
+        }
+    } else {
+        Err(ProgramError::InvalidAccountData)
+    }
+}
+
+// Function to check the user's balance (including deposits, borrowings, and interest)
+fn check_balance(loan_pool: &LoanPool, user_account: &AccountInfo<'static>) -> ProgramResult {
+    let user_key = user_account.key;
+    let mut total_balance: i64 = 0;
+    if let Some((borrowed_amount, _, _)) = loan_pool.borrowers.get(user_key) {
+        for (_, collateral_vec) in loan_pool.collateral.iter() {
+            for collateral in collateral_vec {
+                total_balance -= collateral.locked_amount as i64;
+            }
+        }
+        total_balance -= *borrowed_amount as i64;
+    }
+    // Here we could add logic to include deposits in the balance calculation if we had a proper way to track user deposits in the contract.
+    msg!("User balance: {}", total_balance);
+    Ok(())
+}
+
+// Function to lock collateral for a borrowing
+fn lock_collateral(
+    loan_pool: &mut LoanPool,
+    accounts_iter: &mut std::slice::Iter<AccountInfo<'static>>,
+) -> ProgramResult {
+    let user_account = next_account_info(accounts_iter)?;
+    let collateral_token_account = next_account_info(accounts_iter)?;
+    let amount_data = next_account_info(accounts_iter)?;
+    let amount = amount_data.data.borrow()[0];
+    if amount == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+    let user_key = user_account.key;
+    if let Some
+ ...
